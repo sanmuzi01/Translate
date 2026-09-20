@@ -113,6 +113,25 @@ async function submitSettings() {
   }
 }
 
+// ---- 诊断 ----
+const diagCopied = ref(false);
+
+async function copyDiagnostics() {
+  try {
+    const text = await invoke<string>("diagnostics");
+    await invoke("copy_text", { text });
+    diagCopied.value = true;
+    setTimeout(() => (diagCopied.value = false), 1600);
+  } catch (e) {
+    settingsIsError.value = true;
+    settingsMsg.value = typeof e === "string" ? e : "复制失败";
+  }
+}
+
+function openLogs() {
+  invoke("open_log_dir").catch(() => {});
+}
+
 function backToTranslate() {
   view.value = "translate";
   nextTick(() => sourceEl.value?.focus());
@@ -466,7 +485,7 @@ onUnmounted(() => {
 
         <label class="check-row">
           <input v-model="settingsForm.ctrlTapTranslate" type="checkbox" />
-          <span>选中文字后,单独按一下 Ctrl 键翻译(在任何程序里都可用)</span>
+          <span>选中文字后,单独按一下 Ctrl 键翻译(在任何程序里都可用;关闭后程序不再监听键盘)</span>
         </label>
 
         <label class="check-row">
@@ -500,6 +519,12 @@ onUnmounted(() => {
         <button class="btn-ghost pet-entry" @click="settingsForm.glossary.push({ src: '', dst: '' })">
           ＋ 添加术语
         </button>
+
+        <label class="field-label">遇到问题?(诊断信息不含 API Key 和翻译内容)</label>
+        <div class="diag-row">
+          <button class="btn-ghost" @click="copyDiagnostics">{{ diagCopied ? "已复制 ✓" : "复制诊断信息" }}</button>
+          <button class="btn-ghost" @click="openLogs">打开日志文件夹</button>
+        </div>
 
         <div v-if="settingsMsg" class="msg" :class="{ bad: settingsIsError }">
           {{ settingsMsg }}
@@ -949,6 +974,11 @@ onUnmounted(() => {
   margin-top: 3px;
   flex-shrink: 0;
   accent-color: var(--accent);
+}
+.diag-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 .time-input {
   margin-left: auto;

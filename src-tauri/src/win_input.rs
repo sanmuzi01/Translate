@@ -1,7 +1,7 @@
 //! Windows 专用的底层输入辅助:全局键盘/鼠标钩子、前台窗口信息、剪贴板序号。
 //! "按一下 Ctrl 翻译选中文字"要在任何程序里感知到 Ctrl 键,普通窗口事件做不到,只能用系统级钩子。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -9,11 +9,12 @@ use std::time::Instant;
 use windows::Win32::Foundation::{CloseHandle, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, SetWindowsHookExW,
+    CallNextHookEx, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, PostThreadMessageW,
+    SetWindowsHookExW, UnhookWindowsHookEx, WM_QUIT,
     KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYUP,
     WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_RBUTTONDOWN, WM_SYSKEYUP,
 };
@@ -100,8 +101,9 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     CallNextHookEx(None, code, wparam, lparam)
 }
 
-/// 安装全局键盘和鼠标钩子,并在独立线程里按顺序调用 handler。
+/// 安装全局鼠标钩子(用来判断"点了弹窗以外的地方"),并在独立线程里按顺序调用 handler。
 /// handler 里可以睡眠/等待(比如等剪贴板),因为它不在钩子线程上。
+/// 键盘钩子不在这里装:只有开启了"单击 Ctrl 划词"才需要,见 set_keyboard_hook。
 pub fn start_input_hooks(handler: impl Fn(InputEvent) + Send + 'static) {
     let (tx, rx) = mpsc::channel();
     if TX.set(tx).is_err() {
@@ -115,14 +117,48 @@ pub fn start_input_hooks(handler: impl Fn(InputEvent) + Send + 'static) {
     // 低级钩子必须由"有消息循环的线程"安装,否则回调永远不会被调用
     std::thread::spawn(|| unsafe {
         if SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), None, 0).is_err() {
-            eprintln!("安装鼠标钩子失败");
+            crate::log_error!("安装鼠标钩子失败(可能被安全软件拦截)");
+            return;
         }
-        if SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0).is_err() {
-            eprintln!("安装键盘钩子失败,按 Ctrl 划词翻译不可用");
-        }
+        crate::log_info!("鼠标监听已安装");
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
     });
+}
+
+/// 键盘钩子所在线程的 id。0 = 没装;u32::MAX = 正在安装(占位,防止重复启动)。
+static KB_THREAD: AtomicU32 = AtomicU32::new(0);
+
+/// 开/关键盘钩子。关闭时真的把钩子卸掉,而不是装着不用:
+/// 全局键盘监听是杀毒软件最敏感的行为之一,用户不需要"单击 Ctrl 划词"时就不该带着它。
+pub fn set_keyboard_hook(enabled: bool) {
+    let tid = KB_THREAD.load(Ordering::SeqCst);
+    if enabled && tid == 0 {
+        KB_THREAD.store(u32::MAX, Ordering::SeqCst);
+        std::thread::spawn(|| unsafe {
+            let hook = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) {
+                Ok(h) => h,
+                Err(_) => {
+                    crate::log_error!("安装键盘钩子失败(可能被安全软件拦截),单击 Ctrl 划词不可用");
+                    KB_THREAD.store(0, Ordering::SeqCst);
+                    return;
+                }
+            };
+            KB_THREAD.store(GetCurrentThreadId(), Ordering::SeqCst);
+            crate::log_info!("键盘监听已安装");
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+            let _ = UnhookWindowsHookEx(hook);
+            CTRL_DOWN.store(false, Ordering::Relaxed);
+            KB_THREAD.store(0, Ordering::SeqCst);
+            crate::log_info!("键盘监听已卸载");
+        });
+    } else if !enabled && tid != 0 && tid != u32::MAX {
+        // 给钩子线程发退出消息,它跳出消息循环后会自己卸载钩子
+        unsafe {
+            let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+    }
 }
 
 /// 剪贴板内容每变化一次序号就 +1。用它判断"刚才那次复制到底有没有发生",

@@ -1,3 +1,5 @@
+#[macro_use]
+mod logger;
 #[cfg(windows)]
 mod win_input;
 mod pets;
@@ -313,6 +315,8 @@ fn save_settings(app: AppHandle, mut settings: Settings) -> Result<(), String> {
     }
     write_settings(&app, &settings)?;
     CTRL_TAP_ENABLED.store(settings.ctrl_tap_translate, Ordering::Relaxed);
+    #[cfg(windows)]
+    win_input::set_keyboard_hook(settings.ctrl_tap_translate);
     Ok(())
 }
 
@@ -418,6 +422,7 @@ async fn translate_text(
         .send()
         .await
         .map_err(|e| {
+            log_warn!("翻译网络错误:超时={} 连接失败={}", e.is_timeout(), e.is_connect());
             if e.is_timeout() {
                 "请求超时,请检查网络后重试".to_string()
             } else if e.is_connect() {
@@ -430,6 +435,7 @@ async fn translate_text(
     let status = res.status();
     if !status.is_success() {
         let detail = res.text().await.unwrap_or_default();
+        log_warn!("翻译请求失败:HTTP {}", status.as_u16());
         // 把常见的状态码翻译成用户看得懂、知道该怎么办的话,原始响应只在未知错误时才显示
         return Err(match status.as_u16() {
             401 => "API Key 无效或已失效,请在设置里检查".to_string(),
@@ -484,6 +490,92 @@ fn do_show_main_window(app: &AppHandle) {
         let _ = win.unminimize();
         let _ = win.set_focus();
     }
+}
+
+/// 从 `ver` 命令的输出里取出版本号。中文系统里这行输出是 GBK 编码,直接按 UTF-8 读会是乱码,
+/// 但版本号本身只有数字和点,挑出来就行(如 "10.0.26200.9457";构建号 >= 22000 是 Windows 11)。
+fn parse_windows_version(raw: &str) -> String {
+    raw.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .find(|t| t.matches('.').count() >= 2 && t.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .unwrap_or("未知")
+        .to_string()
+}
+
+/// 前端的错误也写进同一份日志(网页里的报错用户看不见,只有日志里能留下)
+#[tauri::command]
+fn log_frontend(level: String, msg: String) {
+    let msg: String = msg.chars().take(500).collect();
+    match level.as_str() {
+        "error" => log_error!("[前端] {msg}"),
+        _ => log_warn!("[前端] {msg}"),
+    }
+}
+
+#[tauri::command]
+fn open_log_dir(app: AppHandle) -> Result<(), String> {
+    let dir = logger::path()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .or_else(|| app.path().app_log_dir().ok())
+        .ok_or("找不到日志目录")?;
+    let _ = fs::create_dir_all(&dir);
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer").arg(&dir).spawn().map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
+/// 诊断信息:遇到问题时一键复制,发给开发者。不含 API Key 和翻译内容。
+#[tauri::command]
+fn diagnostics(app: AppHandle) -> String {
+    let st = load_settings(&app);
+    let mut out = String::new();
+    out.push_str(&format!("软件版本: {}\n", env!("CARGO_PKG_VERSION")));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let ver = std::process::Command::new("cmd")
+            .args(["/c", "ver"])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW:不要闪一下黑窗口
+            .output()
+            .map(|o| parse_windows_version(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or_default();
+        out.push_str(&format!("系统: Windows {ver}\n"));
+    }
+    if let Ok(monitors) = app.available_monitors() {
+        for (i, m) in monitors.iter().enumerate() {
+            out.push_str(&format!(
+                "显示器{}: {}x{} 缩放{}%\n",
+                i + 1,
+                m.size().width,
+                m.size().height,
+                (m.scale_factor() * 100.0).round()
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "设置: API Key {} | 显示快捷键 {} | 划词快捷键 {} | 单击Ctrl划词 {} | 目标语言 {} | 领域 {} | 术语 {} 条 | 提醒 {} {}\n",
+        if st.api_key.trim().is_empty() { "未填写" } else { "已填写" },
+        st.toggle_shortcut,
+        st.quick_translate_shortcut,
+        if st.ctrl_tap_translate { "开" } else { "关" },
+        st.target_lang,
+        st.domain,
+        st.glossary.len(),
+        if st.reminder_enabled { "开" } else { "关" },
+        st.reminder_time,
+    ));
+    {
+        use tauri_plugin_autostart::ManagerExt;
+        out.push_str(&format!("开机自启: {}\n", app.autolaunch().is_enabled().unwrap_or(false)));
+    }
+    out.push_str("\n--- 最近日志 ---\n");
+    out.push_str(&logger::tail(60));
+    out
 }
 
 /// 开机自启:直接读写系统里的启动项,以系统实际状态为准(用户可能在任务管理器里改过)。
@@ -558,7 +650,7 @@ fn quick_translate_flow(app: AppHandle) {
     let mut enigo = match Enigo::new(&EnigoSettings::default()) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("初始化 enigo 失败: {e}");
+            log_error!("Alt+C 划词:初始化键盘模拟失败: {e}");
             return;
         }
     };
@@ -608,8 +700,10 @@ fn quick_translate_flow(app: AppHandle) {
     }
 
     if text.trim().is_empty() {
+        log_info!("Alt+C 划词:没有取到选中的文字(前台程序可能不支持复制,或没有选中)");
         return;
     }
+    log_info!("Alt+C 划词:取到 {} 个字符,弹出译文", text.chars().count());
 
     show_quick_translate_popup(&app, mouse_x, mouse_y, text, true);
 }
@@ -704,7 +798,7 @@ fn show_quick_translate_popup(app: &AppHandle, mx: i32, my: i32, text: String, f
             let _ = app.emit_to("popup", "quick-translate", &text);
         }
         Err(e) => {
-            eprintln!("创建划词翻译弹窗失败: {e}");
+            log_error!("创建划词翻译弹窗失败: {e}");
         }
     }
 }
@@ -752,7 +846,9 @@ fn handle_input_event(app: &AppHandle, ev: win_input::InputEvent) {
             }
         }
         InputEvent::CtrlTap => {
-            if CTRL_TAP_ENABLED.load(Ordering::Relaxed) {
+            let enabled = CTRL_TAP_ENABLED.load(Ordering::Relaxed);
+            log_info!("检测到单击 Ctrl(功能{})", if enabled { "开启" } else { "已关闭,忽略" });
+            if enabled {
                 ctrl_tap_translate_flow(app);
             }
         }
@@ -765,9 +861,11 @@ fn ctrl_tap_translate_flow(app: &AppHandle) {
 
     // 前台是本应用自己的窗口(主面板等)时不处理:那里有自己的输入框和右键菜单
     let Some((pid, exe)) = win_input::foreground_process() else {
+        log_warn!("Ctrl 单击:取不到前台窗口所属的进程");
         return;
     };
     if pid == std::process::id() || SELECTION_SKIP.contains(&exe.as_str()) {
+        log_info!("Ctrl 单击:前台是 {exe},按规则跳过");
         return;
     }
 
@@ -776,6 +874,7 @@ fn ctrl_tap_translate_flow(app: &AppHandle) {
     std::thread::sleep(Duration::from_millis(60));
 
     let Ok(mut enigo) = Enigo::new(&EnigoSettings::default()) else {
+        log_error!("Ctrl 单击:初始化键盘模拟失败");
         return;
     };
     let (mouse_x, mouse_y) = enigo.location().unwrap_or((0, 0));
@@ -807,8 +906,11 @@ fn ctrl_tap_translate_flow(app: &AppHandle) {
         }
     }
     if text.trim().is_empty() {
-        return; // 没有选中文字(或选中的不是文字)
+        // 没有选中文字,或者前台程序不响应"复制"(部分游戏、远程桌面、以管理员身份运行的程序)
+        log_info!("Ctrl 单击:前台 {exe},没有复制到文字");
+        return;
     }
+    log_info!("Ctrl 单击:前台 {exe},取到 {} 个字符,弹出译文", text.chars().count());
 
     // 把用户原来的剪贴板还回去:否则用户接下来的"粘贴"会粘出刚才选中的文字
     if let Some(old) = backup {
@@ -894,6 +996,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    logger::install_panic_hook();
     tauri::Builder::default()
         // 单实例插件必须第一个注册。第二次启动(双击图标/开机自启后又手动打开)不会开出第二个程序,
         // 否则两份程序会各装一套键盘鼠标钩子、抢同一个快捷键。改为把已在运行的主窗口调出来。
@@ -935,7 +1038,10 @@ pub fn run() {
             toggle_main_window,
             open_main_window,
             autostart_get,
-            autostart_set
+            autostart_set,
+            log_frontend,
+            open_log_dir,
+            diagnostics
         ])
         .on_window_event(|window, event| {
             // 只拦截主窗口的关闭请求:应用要常驻在托盘里响应全局快捷键,
@@ -949,6 +1055,19 @@ pub fn run() {
         })
         .setup(|app| {
             let handle = app.handle();
+            if let Ok(dir) = handle.path().app_log_dir() {
+                logger::init(dir);
+            }
+            let screens = handle
+                .available_monitors()
+                .map(|ms| {
+                    ms.iter()
+                        .map(|m| format!("{}x{}@{}%", m.size().width, m.size().height, (m.scale_factor() * 100.0).round()))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            log_info!("程序启动 v{} 显示器: {}", env!("CARGO_PKG_VERSION"), screens);
             setup_tray(handle)?;
             // 开机自启时只让桌宠和托盘出现,不要一登录就弹出翻译面板
             if std::env::args().any(|a| a == "--autostart") {
@@ -968,11 +1087,12 @@ pub fn run() {
             {
                 let hook_app = handle.clone();
                 win_input::start_input_hooks(move |ev| handle_input_event(&hook_app, ev));
+                win_input::set_keyboard_hook(settings.ctrl_tap_translate);
             }
             if let Err(e) = register_shortcuts(handle, &settings) {
                 // 如果保存的快捷键字符串已经损坏/不合法,回退到默认快捷键,
                 // 保证应用至少还能用默认组合键打开。
-                eprintln!("注册快捷键失败,回退默认值: {e}");
+                log_warn!("注册快捷键失败,回退默认值: {e}");
                 let _ = register_shortcuts(handle, &Settings::default());
             }
 
@@ -993,6 +1113,14 @@ mod tests {
         // 日文含假名,即使汉字很多也不能当中文(否则会被译成英文而不是中文)
         assert!(!is_mostly_chinese("東京は日本の首都です"));
         assert!(!is_mostly_chinese(""));
+    }
+
+    #[test]
+    fn windows_version_is_extracted_even_from_garbled_output() {
+        let garbled = "\nMicrosoft Windows [\u{fffd}\u{fffd}\u{fffd}\u{fffd} 10.0.26200.9457]\n";
+        assert_eq!(parse_windows_version(garbled), "10.0.26200.9457");
+        assert_eq!(parse_windows_version("Microsoft Windows [Version 10.0.19045.3]"), "10.0.19045.3");
+        assert_eq!(parse_windows_version("nothing here"), "未知");
     }
 
     #[test]

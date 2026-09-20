@@ -38,6 +38,9 @@
 **wave(挥手,6 帧,3 列 × 2 行)**
 > The character standing and waving one small arm up and down in a friendly greeting, 6 frames looping.
 
+**look(转头看,4 列 × 1 行)**
+> The character standing and slowly turning its helmeted head to look around: 4 frames, head turns a little to one side then the other, body stays still, tiny differences.
+
 **held(被提起,3 列 × 1 行)**
 > The character being lifted by the top of the helmet, body and legs dangling and swinging helplessly, 3 frames.
 
@@ -60,3 +63,23 @@
 - **某个动作里角色显得太大或太小**:配置 `{ "sit": { "scale": 0.9 } }`。
 - **播放太快或太慢**:配置 `{ "walk": { "fps": 7 } }`。
 - 改完配置后重新运行 `python tools/prepare_frames.py walk`(只重做指定的动作)。
+
+
+## 现在还缺哪些动作(优先级)
+
+内置桌宠目前已有:走路、待机、坐下、睡觉、挥手、开心、被提起、落地。
+下面这些还是"拿别的图加程序动作顶替",画了专属帧会自然很多:
+
+1. **hop(跳)** —— 桌宠最常做的动作之一,效果提升最明显。
+2. **surprise(受惊)** —— 被点击时触发。
+3. **stretch(伸懒腰)** —— 休息模式里会出现。
+4. **look(转头)** —— 闲逛时偶尔出现。
+
+## 生成之后怎么接进去
+
+1. 出图保存为 `pet-frames/raw/<动作名>.png`(例如 `hop.png`)。
+2. **保持角色大小一致**:提示词里加一句 "the character is exactly the same size as in the reference".
+   如果生成的图里角色比其他动作大或小,在 `pet-frames/config.json` 里给这个动作单独设 `ref_h`(角色站立时的像素高度)。
+3. 只处理新动作:`python tools/prepare_frames.py hop surprise stretch look`(不会影响已有动作)。
+4. 看 `pet-frames/preview/` 里的预览,脚底应落在红线上。
+5. 重新构建软件:`npm run tauri build`。
