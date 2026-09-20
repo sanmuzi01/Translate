@@ -1,0 +1,11 @@
+{
+  "*": { "ref_h": 380, "scale": 1.0 },
+  "walk": { "fps": 9 },
+  "idle": { "fps": 1, "mode": "loop" },
+  "happy": { "fps": 6 },
+  "wave": { "fps": 6 },
+  "held": { "fps": 7 },
+  "land": { "fps": 6 },
+  "sit": { "fps": 1.5 },
+  "sleep": { "fps": 1.2 }
+}

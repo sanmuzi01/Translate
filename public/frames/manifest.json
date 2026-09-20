@@ -1,0 +1,45 @@
+{
+  "frameSize": 280,
+  "actions": {
+    "happy": {
+      "count": 4,
+      "fps": 6,
+      "mode": "loop"
+    },
+    "held": {
+      "count": 2,
+      "fps": 7,
+      "mode": "loop"
+    },
+    "idle": {
+      "count": 1,
+      "fps": 1,
+      "mode": "loop"
+    },
+    "land": {
+      "count": 2,
+      "fps": 6,
+      "mode": "once"
+    },
+    "sit": {
+      "count": 1,
+      "fps": 1.5,
+      "mode": "pingpong"
+    },
+    "sleep": {
+      "count": 1,
+      "fps": 1.2,
+      "mode": "pingpong"
+    },
+    "walk": {
+      "count": 8,
+      "fps": 9,
+      "mode": "loop"
+    },
+    "wave": {
+      "count": 4,
+      "fps": 6,
+      "mode": "loop"
+    }
+  }
+}
